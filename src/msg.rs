@@ -7,7 +7,7 @@ use nix::sys::socket::{
 use smallvec::SmallVec;
 use std::error::Error;
 use std::io::{self as stdio, IoSlice, IoSliceMut};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::task::{self, ready, Poll};
@@ -25,7 +25,7 @@ const MAX_FDS_IN_ONE_CMSG: usize = 28;
 /// (SCM stands for Socket-level Control Message, by the way.)
 #[derive(Debug)]
 pub struct SockScm {
-    sock_fd: AsyncFd<RawFd>,
+    sock_fd: AsyncFd<OwnedFd>,
     /// Tuple (file descriptor, byte position it was obtained at).
     scm_fds: SmallVec<[(RawFd, usize); MAX_FDS_IN_ONE_CMSG]>,
     /// Current number of bytes read.
@@ -40,12 +40,17 @@ pub struct SockScm {
 impl Unpin for SockScm {}
 
 impl SockScm {
-    pub fn new(fd: RawFd) -> io::Result<Self> {
+    pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
         Ok(Self {
             sock_fd: AsyncFd::new(fd)?,
             scm_fds: SmallVec::new(),
             bytepos: 0,
         })
+    }
+
+    /// Consumes `self`, returning the owned file descriptor.
+    pub fn into_fd(self) -> OwnedFd {
+        self.sock_fd.into_inner()
     }
 
     /// Returns the file descriptors that were read between byte positions
@@ -267,7 +272,7 @@ pub async fn send_msg(sock: &mut SockScm, msg: &RawMsg) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{FromRawFd, IntoRawFd};
 
     use super::*;
 
@@ -279,13 +284,7 @@ mod tests {
     fn basic_recv() {
         crate::test_harness!(|| {
             let (mut tx, rx) = UnixStream::pair().unwrap();
-            let (o1, o2) = socketpair(
-                AddressFamily::Unix,
-                SockType::Stream,
-                None,
-                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC
-            ).unwrap();
-            let mut scm = BufReader::new(SockScm::new(rx.into_std().unwrap().into_raw_fd()).unwrap());
+            let mut scm = BufReader::new(SockScm::from_fd(rx.into_std().unwrap().into()).unwrap());
 
             macro_rules! check {
                 ($a:expr, $b:expr) => {
@@ -319,8 +318,9 @@ mod tests {
             (o1.into_raw_fd(), o2.into_raw_fd())
         }, |sockpair, (sender_obj_id: u32, payload_len_in_u32 in 0..16380u16, opcode: u16)| {
             let payload_len = payload_len_in_u32 * 4;
-            let (fd1, fd2) = sockpair;
-            let (s1, s2) = (SockScm::new(fd1).unwrap(), SockScm::new(fd2).unwrap());
+            let (rfd1, rfd2) = sockpair;
+            let (fd1, fd2) = unsafe { (OwnedFd::from_raw_fd(rfd1), OwnedFd::from_raw_fd(rfd2)) };
+            let (s1, s2) = (SockScm::from_fd(fd1).unwrap(), SockScm::from_fd(fd2).unwrap());
             let (mut s1, mut s2) = (BufReader::new(s1), BufReader::new(s2));
             let payload = vec![0xFF_FF_FF_FF; payload_len_in_u32 as usize];
             send_msg(s1.get_mut(), &RawMsg {
@@ -328,7 +328,7 @@ mod tests {
                 total_msg_len: payload_len + 8,
                 opcode,
                 payload: payload.clone(),
-                fds: vec![fd1]
+                fds: vec![rfd1]
             }).await.unwrap();
             let msg = recv_msg(&mut s2).await.unwrap();
             prop_assert_eq!(msg.sender_obj_id, sender_obj_id);
@@ -336,9 +336,13 @@ mod tests {
             prop_assert_eq!(msg.opcode, opcode);
             prop_assert_eq!(&msg.payload, &payload);
             // the fd number may be different on the other side
-            prop_assert!(msg.fds.len() == 1, "msg.fds: {:?}", msg.fds);
+            prop_assert!(msg.fds.len() == 1, "msg.fds = {:?}", msg.fds);
             // close extra fd so we don't accumulate open files
             nix::unistd::close(msg.fds[0]).unwrap();
+            // don't close the socket fds so we can use them again
+            let (fd1, fd2) = (s1.into_inner().into_fd(), s2.into_inner().into_fd());
+            std::mem::forget(fd1);
+            std::mem::forget(fd2);
         });
     }
 }
